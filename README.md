@@ -28,6 +28,7 @@ Let's say you want to do a security audit for a codebase. These are the steps to
  
 Watch it start the dynamic workflow for you, bypassing the blocks.  You can customize the workflows. See workflows/ for examples. 
 
+<img width="1536" height="606" alt="image" src="https://github.com/user-attachments/assets/6a1223ff-1d57-44d4-b34a-d475a49c5189" />
 
 ## Authentication
 
