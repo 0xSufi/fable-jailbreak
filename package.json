@@ -1,0 +1,19 @@
+{
+  "name": "wf-engine",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Standalone runner for cc-wasm dynamic-workflow scripts — talks to the Anthropic API directly, no cc-wasm runtime.",
+  "type": "module",
+  "bin": {
+    "wf-engine": "./wf-engine"
+  },
+  "scripts": {
+    "start": "./wf-engine"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.39.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
