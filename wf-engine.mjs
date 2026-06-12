@@ -19,25 +19,36 @@
 
 import { createContext, runInContext } from 'node:vm';
 import { randomBytes, createHash } from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const IS_WIN = process.platform === 'win32';
+// fileURLToPath handles Windows drive letters (file:///C:/...) correctly; the
+// raw URL.pathname gives /C:/... which is not a valid Windows path for path.*
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function stderrEarly(s) { process.stderr.write(s + '\n'); }
 
 // Resolve the SDK (absolute path; ESM ignores NODE_PATH for bare imports).
 const SDK_CANDIDATES = [
   process.env.WF_SDK_PATH,
-  '/data2/code/Dyspel/cwd/monorepo/packages/cc-wasm/node_modules/@anthropic-ai/sdk/index.mjs',
-  path.join(path.dirname(new URL(import.meta.url).pathname), 'app', 'node_modules', '@anthropic-ai', 'sdk', 'index.mjs'),
+  // local node_modules after `npm install` in the package directory
+  path.join(__dirname, 'node_modules', '@anthropic-ai', 'sdk', 'index.mjs'),
+  path.join(__dirname, 'node_modules', '@anthropic-ai', 'sdk', 'index.js'),
+  // cc-wasm sibling install (when placed next to the cc-wasm app directory)
+  path.join(__dirname, 'app', 'node_modules', '@anthropic-ai', 'sdk', 'index.mjs'),
 ].filter(Boolean);
 let Anthropic;
 {
   let lastErr;
   for (const cand of SDK_CANDIDATES) {
     try {
-      const url = cand.startsWith('/') ? 'file://' + cand : cand;
+      // pathToFileURL handles Windows paths (C:\...) and Unix paths (/...)
+      // correctly. Skip conversion for values that are already URLs.
+      const url = /^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\//.test(cand) ? cand : pathToFileURL(cand).href;
       Anthropic = (await import(url)).default;
       if (Anthropic) break;
     } catch (e) { lastErr = e; }
@@ -68,7 +79,7 @@ const COLLECTION_CAP = 4096;
 // ───────────────────────── small utils ─────────────────────────
 const isObj = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
 const stderr = (s) => process.stderr.write(s + '\n');
-function mungeProject(p) { return p.replace(/\//g, '-'); }
+function mungeProject(p) { return p.replace(/[/\\:]/g, '-'); }
 function runId() { return 'wf_' + randomBytes(6).toString('hex'); }
 function sha256(s) { return createHash('sha256').update(s).digest('hex'); }
 // Deterministic JSON (sorted keys) so resume keys are stable across runs.
@@ -221,20 +232,43 @@ function makeSemaphore(max) {
   return { acquire, release };
 }
 
+// ───────────────────────── shell detection ─────────────────────────
+// On Unix: always bash (login shell).
+// On Windows: prefer bash (Git Bash / WSL) for cross-platform script compatibility,
+// fall back to PowerShell when neither is present.
+function resolveShell() {
+  if (!IS_WIN) return { cmd: 'bash', args: ['-lc'], label: 'bash' };
+  for (const candidate of ['bash', 'wsl']) {
+    try {
+      execFileSync(candidate, ['--version'], { timeout: 1000, stdio: 'ignore' });
+      return candidate === 'wsl'
+        ? { cmd: 'wsl', args: ['bash', '-c'], label: 'bash (WSL)' }
+        : { cmd: 'bash', args: ['-c'], label: 'bash' };
+    } catch {}
+  }
+  return { cmd: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-Command'], label: 'PowerShell' };
+}
+const SHELL = resolveShell();
+
 // ───────────────────────── bash tool ─────────────────────────
 function runBash(command, cwd, signal) {
   return new Promise((resolve) => {
     execFile(
-      'bash', ['-lc', command],
+      SHELL.cmd, [...SHELL.args, command],
       { cwd, timeout: AGENT_TIMEOUT_MS, maxBuffer: BASH_MAX_BUFFER, signal },
       (err, stdout, stderrOut) => {
         let out = (stdout || '') + (stderrOut || '');
         if (err) {
           // Never throw — return the error text as the result so the model can react.
-          if (err.killed && err.signal === 'SIGTERM') out += `\n[bash: command timed out after ${AGENT_TIMEOUT_MS}ms]`;
-          else if (err.code === 'ABORT_ERR' || (signal && signal.aborted)) out += `\n[bash: aborted]`;
-          else if (typeof err.code === 'number') out += `\n[bash: exit code ${err.code}]`;
-          else out += `\n[bash: ${err.message}]`;
+          // On Windows SIGTERM may be null when Node forcibly kills the process.
+          if (err.killed && (err.signal === 'SIGTERM' || (IS_WIN && err.signal == null)))
+            out += `\n[${SHELL.label}: command timed out after ${AGENT_TIMEOUT_MS}ms]`;
+          else if (err.code === 'ABORT_ERR' || (signal && signal.aborted))
+            out += `\n[${SHELL.label}: aborted]`;
+          else if (typeof err.code === 'number')
+            out += `\n[${SHELL.label}: exit code ${err.code}]`;
+          else
+            out += `\n[${SHELL.label}: ${err.message}]`;
         }
         if (out.length > BASH_OUTPUT_CAP) {
           out = out.slice(0, BASH_OUTPUT_CAP) + `\n…[output truncated at ${BASH_OUTPUT_CAP} chars]`;
@@ -248,13 +282,17 @@ function runBash(command, cwd, signal) {
 
 const BASH_TOOL = {
   name: 'bash',
-  description:
-    'Execute a bash command in the repository working directory and return its combined ' +
-    'stdout+stderr. Use this to read files (cat/sed/grep), edit them (sed -i, tee, heredocs), ' +
-    'list/search the tree, and run builds/tests/linters. Output is capped.',
+  description: SHELL.label === 'PowerShell'
+    ? 'Execute a PowerShell command in the repository working directory and return its combined ' +
+      'stdout+stderr. Use this to read files (Get-Content, Select-String), edit them (Set-Content, ' +
+      'Out-File, Add-Content), list/search the tree (Get-ChildItem, Select-String), and run ' +
+      'builds/tests/linters. Output is capped.'
+    : 'Execute a bash command in the repository working directory and return its combined ' +
+      'stdout+stderr. Use this to read files (cat/sed/grep), edit them (sed -i, tee, heredocs), ' +
+      'list/search the tree, and run builds/tests/linters. Output is capped.',
   input_schema: {
     type: 'object',
-    properties: { command: { type: 'string', description: 'The bash command to run.' } },
+    properties: { command: { type: 'string', description: `The ${SHELL.label} command to run.` } },
     required: ['command'],
   },
 };
@@ -486,7 +524,7 @@ function resolveWorkflowFile(nameOrRef, project) {
     path.join(os.homedir(), '.cc-wasm', 'workflows'),
     // bundled templates shipped with this package (roadmap / security-audit /
     // codebase-survey) — resolvable by --name out of the box.
-    path.join(path.dirname(new URL(import.meta.url).pathname), 'workflows'),
+    path.join(__dirname, 'workflows'),
   ];
   for (const d of dirs) {
     for (const ext of ['.js', '.mjs']) {
@@ -733,7 +771,7 @@ async function main() {
     ];
     if (opts.save) out.push(`saved     : ${savedPath}`);
     out.push(`result    : null`);
-    out.push(`snapshots : ${snapDir}/wf_<id>.json   (created on a run)`);
+    out.push(`snapshots : ${path.join(snapDir, 'wf_<id>.json')}   (created on a run)`);
     out.push(`run now   : wf-engine --project '${project}' ` + (opts.save ? `--name ${meta.name}` : opts.script ? `--script ${scriptPath}` : `--name ${meta.name}`));
     process.stdout.write(out.join('\n') + '\n');
     process.exit(0);
